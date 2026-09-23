@@ -1,0 +1,156 @@
+# Woodpecker CI for the local-first fork.
+#
+# Two layers, both small on purpose:
+#
+#   Tier 1 (always-on, ~3-5 min, blocks merge)
+#     pnpm guard                       — static checks, layout guards, package boundary checks
+#     pnpm typecheck                   — typescript correctness across all packages
+#     contracts tests                  — shared contracts/DTOs are the lingua franca
+#     daemon BYOK + SSRF slice         — local-first-ssrf, origin-validation, asset URL guards
+#     packaged tests                   — env allowlist and packaged sidecars
+#
+#   Tier 2 (always-on, ~15-25 min, blocks merge)
+#     daemon full Vitest               — broad regression net for "I've been editing many things"
+#     web tests                        — i18n / components
+#     packages tests                   — sidecar, sidecar-proto, platform, standalone, contracts
+#     tools tests                      — tools-dev, tools-pack, tools-serve, tools-release
+#
+#   Tier 3 (manual trigger only, ~60+ min)
+#     e2e Vitest                       — cross-app / cross-runtime tests
+#
+# Why this is NOT a copy of the upstream `.github/workflows/ci.yml`:
+#   - No `convergence.atom.yml` / `comment.atom.yml` / `report.atom.yml` /
+#     `autofix.atom.yml`. Those are GitHub-Actions-specific atomic capabilities
+#     (see `.github/AGENTS.md`). Woodpecker just runs tests and reports status.
+#   - No reusable-result convergence: `OD_WORKLOAD_RESULTS_BASE_URL` requires
+#     an R2 bucket we don't have on a personal fork. The convergence cache is
+#     a 1-to-1 mapping of declared workloads to validated past runs, with
+#     public read access; on a fork we just re-run.
+#   - No custom runner pool (`nexu-runners-small` is the upstream ARC fleet);
+#     we run on the Woodpecker agent's image.
+#   - Tier 3 is `when.event: manual` because it needs the full tools-dev
+#     harness + a packaged build, and doesn't gate a feature PR's correctness.
+#
+# Required secrets on the Woodpecker agent (not on the fork):
+#   - WOODPECKER_GITHUB_HOOK_SECRET — matches the webhook's "Secret" header
+#   - A PAT with `repo` scope (gives `repo:status`) for status reporting
+#
+# Branch protection on `main` requires the Tier 1 checks to pass before merge.
+# Tier 2 is reported but not blocking by default.
+#
+# Step isolation: each Woodpecker step is a fresh container with no shared
+# corepack state. Every step sources `.woodpecker/pnpm-setup.sh` before any
+# `pnpm …` invocation.
+
+when:
+  event: [push, pull_request, manual]
+  branch: [main, 'feat/**', 'fix/**', 'ci/**']
+
+steps:
+  install:
+    image: node:24
+    environment:
+      CI: 'true'
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm install --frozen-lockfile
+
+  # --- Tier 1: fast gate (~3-5 min) ---
+
+  guard:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm guard
+    depends_on: [install]
+
+  typecheck:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm typecheck
+    depends_on: [install]
+
+  contracts-tests:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm --filter @open-design/contracts test
+    depends_on: [install]
+
+  daemon-byok-ssrf-tests:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm --filter @open-design/daemon exec vitest run -c vitest.config.ts
+          --hook-timeout=60000
+          tests/local-first-ssrf.test.ts
+          tests/origin-validation.test.ts
+          tests/library-ingest-ssrf.test.ts
+          tests/aihubmix-asset-ssrf.test.ts
+          tests/aihubmix-catalog-ssrf.test.ts
+          tests/plugin-asset-cache.test.ts
+          tests/byok-tools.test.ts
+    depends_on: [install]
+
+  desktop-build:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm --filter @open-design/desktop build
+    depends_on: [install]
+
+  packaged-tests:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm --filter @open-design/packaged test
+    depends_on: [install, desktop-build]
+
+  # --- Tier 2: broader regression (~15-25 min) ---
+
+  daemon-full-tests:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm --filter @open-design/daemon test
+    depends_on: [install]
+
+  web-tests:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm --filter @open-design/web test
+    depends_on: [install]
+
+  packages-tests:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm --filter @open-design/sidecar exec vitest run --test-timeout=60000
+      - pnpm --filter @open-design/sidecar-proto test
+      - pnpm --filter @open-design/platform test
+      - pnpm --filter @open-design/standalone test
+      - pnpm --filter @open-design/contracts test
+    depends_on: [install]
+
+  tools-tests:
+    image: node:24
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm --filter @open-design/tools-dev test
+      - pnpm --filter @open-design/tools-pack test
+      - pnpm --filter @open-design/tools-serve exec vitest run --test-timeout=60000
+      - pnpm --filter @open-design/tools-release test
+    depends_on: [install]
+
+  # --- Tier 3: heavy lane (manual trigger only) ---
+
+  e2e-heavy:
+    image: node:24
+    when:
+      event: [manual]
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm --filter @open-design/e2e test
+    depends_on: [install]
