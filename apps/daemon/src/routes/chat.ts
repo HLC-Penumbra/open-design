@@ -33,7 +33,7 @@ import {
 } from '../integrations/aihubmix.js';
 import { isSafeId as isSafeProjectId } from '../projects.js';
 import { projectKindToTracking } from '@open-design/contracts/analytics';
-import { proxyDispatcherRequestInit, validateUserProviderBaseUrl } from '../connectionTest.js';
+import { proxyDispatcherRequestInit, validateBaseUrlResolved } from '../connectionTest.js';
 import { isKnownReasoningEffort, resolveModelForServiceTier } from '../runtimes/models.js';
 import { googleStreamGenerateContentUrl } from '../integrations/google-models.js';
 import { createRoleMarkerGuard } from '../role-marker-guard.js';
@@ -478,10 +478,13 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
   // DNS-aware wrapper. The sync `validateBaseUrl` only inspects the literal
   // hostname string, so a public DNS name pointing at an internal address
   // (`internal.example.com → 10.0.0.5`) still passes. We delegate to
-  // `validateUserProviderBaseUrl` here so every proxy/stream handler runs the
-  // same resolved-IP check before issuing the upstream request.
+  // `validateBaseUrlResolved` here so every proxy/stream handler runs the
+  // same resolved-IP check before issuing the upstream request. LAN /
+  // CGNAT / ULA / hostname-resolves-into-private ranges are accepted by
+  // design — local-first means the user-configured path trusts them, while
+  // the asset-download URL guard (assertExternalAssetUrl) still rejects.
   const validateExternalApiBaseUrl = (baseUrl: string) => {
-    return validateUserProviderBaseUrl(baseUrl);
+    return validateBaseUrlResolved(baseUrl);
   };
 
   const proxyErrorCode = (status: number) => {

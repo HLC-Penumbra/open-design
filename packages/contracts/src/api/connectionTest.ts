@@ -71,6 +71,32 @@ function isBlockedIpv4(hostname: string): boolean {
   );
 }
 
+// Narrow predicate: the hostnames that are universally misconfigurations and
+// are refused on BOTH the user-configured endpoint path AND the asset URL path.
+// `169.254/16` is the cloud metadata service, `fe80::/10` is link-local,
+// `0.0.0.0` and `::` are the unspecified addresses, `>=224` is multicast.
+// RFC1918, CGNAT, and IPv6 ULA are deliberately NOT here — those are valid
+// local-model hosts on the user-config path (LAN Ollama, LiteLLM on a
+// VPN-only `10.x`, etc.). Local-first trusts the user to point at those
+// addresses; the asset-URL guard has its own, wider predicate
+// (`isBlockedExternalApiHostname`) that still refuses them when the URL
+// arrived inside an upstream response.
+function isUserErrorBogonIpv4(hostname: string): boolean {
+  const parts = parseIpv4(hostname);
+  if (!parts) return false;
+  const [a, b] = parts;
+  return a === 0 || (a === 169 && b === 254) || a >= 224;
+}
+
+function isUserErrorBogonHostname(hostname: string): boolean {
+  const host = normalizeBracketedIpv6(hostname);
+  if (host === '::') return true;
+  if (isUserErrorBogonIpv4(host)) return true;
+  if (/^fe[89ab][0-9a-f]:/i.test(host)) return true;
+  const mapped = ipv4MappedToDotted(hostname);
+  return Boolean(mapped && isUserErrorBogonIpv4(mapped));
+}
+
 function ipv4MappedToDotted(hostname: string): string | null {
   const host = normalizeBracketedIpv6(hostname);
   const mapped = /^::ffff:(.+)$/i.exec(host)?.[1];
@@ -111,50 +137,17 @@ export function isBlockedExternalApiHostname(hostname: string): boolean {
   if (isBlockedIpv4(host)) return true;
   if (/^f[cd][0-9a-f]{2}:/i.test(host)) return true;
   if (/^fe[89ab][0-9a-f]:/i.test(host)) return true;
-  const mapped = ipv4MappedToDotted(host);
+  const mapped = ipv4MappedToDotted(hostname);
   return Boolean(mapped && isBlockedIpv4(mapped));
 }
 
-// Normalized forms a hostname can be matched under: the bracket-stripped,
-// lowercased, trailing-dot-stripped string plus, for IPv4-mapped IPv6
-// literals, the dotted-quad form. Both an allowlist entry and a candidate
-// host are reduced through this so `10.0.0.5`, `10.0.0.5.`, `[::ffff:10.0.0.5]`
-// and `10.0.0.5` all compare equal.
-function internalHostMatchForms(hostname: string): string[] {
-  const normalized = normalizeBracketedIpv6(hostname);
-  const forms = new Set<string>([normalized]);
-  const mapped = ipv4MappedToDotted(hostname);
-  if (mapped) forms.add(mapped.toLowerCase());
-  return [...forms];
-}
-
-// Issue #3225 — explicit, operator-declared escape hatch from the
-// default-deny internal-IP guard. Returns true only when `hostname` matches
-// a host the operator deliberately trusted (see `OD_ALLOWED_INTERNAL_HOSTS`
-// on the daemon). An empty/absent allowlist always returns false, so the
-// strict default is preserved unless an operator opts in. This is consulted
-// ONLY for user-configured provider endpoints, never for the
-// attacker-controllable asset-download SSRF guard.
-export function isAllowlistedInternalHost(
-  hostname: string,
-  allowedInternalHosts?: readonly string[],
-): boolean {
-  if (!allowedInternalHosts || allowedInternalHosts.length === 0) return false;
-  const candidateForms = internalHostMatchForms(hostname);
-  for (const entry of allowedInternalHosts) {
-    if (typeof entry !== 'string' || !entry.trim()) continue;
-    const entryForms = internalHostMatchForms(entry.trim());
-    if (entryForms.some((form) => candidateForms.includes(form))) return true;
-  }
-  return false;
+// Narrow counterpart to `isBlockedExternalApiHostname`: the bogons that are
+// refused on BOTH paths. See `isUserErrorBogonHostname` for the rationale.
+export function isUserErrorBogonApiHostname(hostname: string): boolean {
+  return isUserErrorBogonHostname(hostname);
 }
 
 export interface ValidateBaseUrlOptions {
-  // Hosts the operator has explicitly declared trusted (issue #3225). Each
-  // entry is a bare hostname or IP literal; a host that matches is exempted
-  // from the internal-IP block. Defaults to none, keeping the strict
-  // default-deny behavior for every caller that does not opt in.
-  allowedInternalHosts?: readonly string[];
   // When true, loopback hosts (127.0.0.0/8, ::1, localhost) are treated as
   // forbidden rather than allowed. Used by `assertExternalAssetUrl` for
   // attacker-controllable asset download URLs (issue #5478), where loopback
@@ -184,10 +177,19 @@ export function validateBaseUrl(
   if (options.forbidLoopback && isLoopbackApiHost(hostname)) {
     return { error: 'Loopback addresses blocked for asset URLs', forbidden: true };
   }
+  // Asset path: refuse every non-public address here so a literal RFC1918
+  // hostname short-circuits past the DNS-pinning step (issue #5478).
+  if (options.forbidLoopback && isBlockedExternalApiHostname(hostname)) {
+    return { error: 'Internal IPs blocked', forbidden: true };
+  }
+  // User-config path: refuse only the bogons that are universally
+  // misconfigurations. LAN, CGNAT, IPv6 ULA, and hostnames that resolve
+  // into private space are accepted by design — that is the local-first
+  // contract. The asset path uses its own wider predicate above.
   if (
+    !options.forbidLoopback &&
     !isLoopbackApiHost(hostname) &&
-    !isAllowlistedInternalHost(hostname, options.allowedInternalHosts) &&
-    isBlockedExternalApiHostname(hostname)
+    isUserErrorBogonHostname(hostname)
   ) {
     return { error: 'Internal IPs blocked', forbidden: true };
   }

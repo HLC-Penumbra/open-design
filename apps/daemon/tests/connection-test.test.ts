@@ -31,7 +31,6 @@ import {
   testAgentConnection,
   testProviderConnection,
   validateBaseUrlResolved,
-  validateUserProviderBaseUrl,
   type DnsLookupAddress,
 } from '../src/connectionTest.js';
 import {
@@ -556,8 +555,12 @@ describe('POST /api/provider/models', () => {
     }
   });
 
-  it('rejects private-network base URLs without calling upstream fetch', async () => {
-    const fetchMock = passThroughOrUpstream(() => jsonResponse({}));
+  it('passes a private-network base URL through to the upstream fetch (local-first)', async () => {
+    // Local-First: BYOK base URLs on RFC1918 / CGNAT / IPv6 ULA reach the
+    // upstream provider fetch instead of being refused by the daemon. The
+    // asset-URL guard (assertExternalAssetUrl) still refuses the same
+    // ranges; see `tests/local-first-ssrf.test.ts` for the paired guard.
+    const fetchMock = passThroughOrUpstream(() => jsonResponse({ data: [] }));
     vi.stubGlobal('fetch', fetchMock);
 
     const res = await realFetch(`${baseUrl}/api/provider/models`, {
@@ -570,24 +573,25 @@ describe('POST /api/provider/models', () => {
       }),
     });
     const body = (await res.json()) as Record<string, unknown>;
-    expect(body).toMatchObject({ ok: false, kind: 'forbidden' });
+    expect(body).not.toMatchObject({ kind: 'forbidden' });
     expect(
-      fetchMock.mock.calls.some(
-        ([input]) => !String(input).startsWith(baseUrl),
+      fetchMock.mock.calls.some(([input]) =>
+        String(input).includes('192.168.1.5'),
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
-  // Regression for the DNS-bypass SSRF gap flagged on PR #1176: the route
-  // must resolve the hostname and reject when *any* resolved address is in
-  // a blocked range, not just when the literal hostname is a private IP.
-  it('rejects hostnames that resolve to a private IP without calling upstream fetch', async () => {
-    const fetchMock = passThroughOrUpstream(() => jsonResponse({}));
+  it('passes a hostname that resolves into RFC1918 through to the upstream fetch (local-first)', async () => {
+    // Local-First: a hostname that DNS-resolves into private space is
+    // accepted on the user-config path. The DNS-rebinding / TOCTOU gap is
+    // still closed by the asset-URL guard's pinned lookup; see
+    // `tests/local-first-ssrf.test.ts`.
+    const fetchMock = passThroughOrUpstream(() => jsonResponse({ data: [] }));
     vi.stubGlobal('fetch', fetchMock);
     const dnsSpy = vi
       .spyOn(dnsPromises, 'lookup')
       .mockImplementation((async (hostname: string) => {
-        if (hostname === 'rebind.example.test') {
+        if (hostname === 'lan-gateway.home.lab') {
           return [{ address: '10.0.0.5', family: 4 }];
         }
         const err: NodeJS.ErrnoException = new Error('ENOTFOUND');
@@ -600,38 +604,7 @@ describe('POST /api/provider/models', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           protocol: 'openai',
-          baseUrl: 'https://rebind.example.test/v1',
-          apiKey: 'sk-good',
-        }),
-      });
-      const body = (await res.json()) as Record<string, unknown>;
-      expect(body).toMatchObject({ ok: false, kind: 'forbidden' });
-      expect(
-        fetchMock.mock.calls.some(
-          ([input]) => !String(input).startsWith(baseUrl),
-        ),
-      ).toBe(false);
-    } finally {
-      dnsSpy.mockRestore();
-    }
-  });
-
-  it('lets an operator-allowlisted internal endpoint reach the upstream model fetch (#3225)', async () => {
-    // The exact symptom in #3225 — "Could not fetch models: Internal IPs
-    // blocked". With the host opted in via OD_ALLOWED_INTERNAL_HOSTS, model
-    // discovery must reach the internal gateway instead of returning forbidden.
-    vi.stubEnv('OD_ALLOWED_INTERNAL_HOSTS', '10.0.0.5');
-    const fetchMock = passThroughOrUpstream(() =>
-      jsonResponse({ data: [{ id: 'gpt-4o-internal' }] }),
-    );
-    vi.stubGlobal('fetch', fetchMock);
-    try {
-      const res = await realFetch(`${baseUrl}/api/provider/models`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          protocol: 'openai',
-          baseUrl: 'http://10.0.0.5:11434/v1',
+          baseUrl: 'https://lan-gateway.home.lab/v1',
           apiKey: 'sk-good',
         }),
       });
@@ -639,11 +612,11 @@ describe('POST /api/provider/models', () => {
       expect(body).not.toMatchObject({ kind: 'forbidden' });
       expect(
         fetchMock.mock.calls.some(([input]) =>
-          String(input).includes('10.0.0.5'),
+          String(input).includes('lan-gateway.home.lab'),
         ),
       ).toBe(true);
     } finally {
-      vi.unstubAllEnvs();
+      dnsSpy.mockRestore();
     }
   });
 
@@ -893,7 +866,11 @@ describe('POST /api/test/connection provider mode', () => {
     ).toBe(false);
   });
 
-  it('rejects forbidden AWS Bedrock model-list URLs before static seeds', async () => {
+  it('returns the static Bedrock seed without an outbound fetch', async () => {
+    // Local-First: a LAN base URL passes validation; Bedrock model
+    // discovery returns its static seed instead of issuing an outbound
+    // fetch (Bedrock uses credential-backed discovery that the
+    // API-key smoke test cannot exercise).
     const fetchMock = passThroughOrUpstream(() => jsonResponse({ error: 'unexpected upstream call' }, { status: 500 }));
     vi.stubGlobal('fetch', fetchMock);
 
@@ -909,8 +886,8 @@ describe('POST /api/test/connection provider mode', () => {
     const body = (await res.json()) as Record<string, unknown>;
     expect(res.status).toBe(200);
     expect(body).toMatchObject({
-      ok: false,
-      kind: 'forbidden',
+      ok: true,
+      kind: 'success',
     });
     expect(
       fetchMock.mock.calls.some(
@@ -1322,8 +1299,14 @@ describe('POST /api/test/connection provider mode', () => {
     ).toBe(false);
   });
 
-  it('reports forbidden for an internal-IP base URL without calling fetch', async () => {
-    const fetchMock = passThroughOrUpstream(() => jsonResponse({}));
+  it('passes an internal-IP base URL through to the connection-test fetch (local-first)', async () => {
+    // Local-First: RFC1918 / CGNAT / ULA base URLs reach the upstream
+    // fetch; only the bogons that are universally misconfigurations are
+    // still refused. Pin the LAN-allowed half here; the bogon half is
+    // pinned in `tests/local-first-ssrf.test.ts`.
+    const fetchMock = passThroughOrUpstream(() =>
+      jsonResponse({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }),
+    );
     vi.stubGlobal('fetch', fetchMock);
 
     const res = await realFetch(`${baseUrl}/api/test/connection`, {
@@ -1338,26 +1321,23 @@ describe('POST /api/test/connection provider mode', () => {
       }),
     });
     const body = (await res.json()) as Record<string, unknown>;
-    expect(body.ok).toBe(false);
-    expect(body.kind).toBe('forbidden');
-    // Internal-IP guard fires before any outbound fetch.
+    expect(body).not.toMatchObject({ kind: 'forbidden' });
     expect(
-      fetchMock.mock.calls.some(
-        ([input]) => !String(input).startsWith(baseUrl),
+      fetchMock.mock.calls.some(([input]) =>
+        String(input).includes('192.168.1.5'),
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
-  // Regression for the DNS-bypass SSRF gap flagged on PR #1176: provider
-  // mode must run the same resolved-IP check as the proxy/finalize paths
-  // so a public hostname pointing at a private address can't be fetched.
-  it('reports forbidden for hostnames that resolve to a private IP without calling fetch', async () => {
-    const fetchMock = passThroughOrUpstream(() => jsonResponse({}));
+  it('passes a hostname that resolves into RFC1918 through to the connection-test fetch (local-first)', async () => {
+    const fetchMock = passThroughOrUpstream(() =>
+      jsonResponse({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }),
+    );
     vi.stubGlobal('fetch', fetchMock);
     const dnsSpy = vi
       .spyOn(dnsPromises, 'lookup')
       .mockImplementation((async (hostname: string) => {
-        if (hostname === 'rebind.example.test') {
+        if (hostname === 'lan-gateway.home.lab') {
           return [{ address: '10.0.0.5', family: 4 }];
         }
         const err: NodeJS.ErrnoException = new Error('ENOTFOUND');
@@ -1371,19 +1351,18 @@ describe('POST /api/test/connection provider mode', () => {
         body: JSON.stringify({
           mode: 'provider',
           protocol: 'openai',
-          baseUrl: 'https://rebind.example.test/v1',
+          baseUrl: 'https://lan-gateway.home.lab/v1',
           apiKey: 'sk-good',
           model: 'gpt-4o',
         }),
       });
       const body = (await res.json()) as Record<string, unknown>;
-      expect(body.ok).toBe(false);
-      expect(body.kind).toBe('forbidden');
+      expect(body).not.toMatchObject({ kind: 'forbidden' });
       expect(
-        fetchMock.mock.calls.some(
-          ([input]) => !String(input).startsWith(baseUrl),
+        fetchMock.mock.calls.some(([input]) =>
+          String(input).includes('lan-gateway.home.lab'),
         ),
-      ).toBe(false);
+      ).toBe(true);
     } finally {
       dnsSpy.mockRestore();
     }
@@ -1424,13 +1403,15 @@ describe('POST /api/test/connection provider mode', () => {
     }
   });
 
-  it('reports forbidden for internal IPv6 base URLs without calling fetch', async () => {
-    for (const blockedBaseUrl of [
-      'http://[fd00::1]:1234/v1',
-      'http://[fe80::1]:1234/v1',
-      'http://[::ffff:192.168.1.5]:1234/v1',
-    ]) {
-      const fetchMock = passThroughOrUpstream(() => jsonResponse({}));
+  it('passes IPv6 ULA base URLs through (local-first) but still refuses link-local', async () => {
+    for (const [providerBaseUrl, expected] of [
+      ['http://[fd00::1]:1234/v1', 'pass'],
+      ['http://[::ffff:192.168.1.5]:1234/v1', 'pass'],
+      ['http://[fe80::1]:1234/v1', 'forbidden'],
+    ] as const) {
+      const fetchMock = passThroughOrUpstream(() =>
+        jsonResponse({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }),
+      );
       vi.stubGlobal('fetch', fetchMock);
 
       const res = await realFetch(`${baseUrl}/api/test/connection`, {
@@ -1439,19 +1420,23 @@ describe('POST /api/test/connection provider mode', () => {
         body: JSON.stringify({
           mode: 'provider',
           protocol: 'openai',
-          baseUrl: blockedBaseUrl,
+          baseUrl: providerBaseUrl,
           apiKey: 'sk-good',
           model: 'gpt-4o',
         }),
       });
       const body = (await res.json()) as Record<string, unknown>;
-      expect(body.ok).toBe(false);
-      expect(body.kind).toBe('forbidden');
-      expect(
-        fetchMock.mock.calls.some(
-          ([input]) => !String(input).startsWith(baseUrl),
-        ),
-      ).toBe(false);
+      const upstreamTouched = fetchMock.mock.calls.some(
+        ([input]) => !String(input).startsWith(baseUrl),
+      );
+      if (expected === 'forbidden') {
+        expect(body, providerBaseUrl).toMatchObject({ ok: false, kind: 'forbidden' });
+        // The validation must block before any outbound upstream fetch.
+        expect(upstreamTouched, providerBaseUrl).toBe(false);
+      } else {
+        expect(body, providerBaseUrl).not.toMatchObject({ kind: 'forbidden' });
+        expect(upstreamTouched, providerBaseUrl).toBe(true);
+      }
       vi.unstubAllGlobals();
     }
   });
@@ -4879,17 +4864,31 @@ describe('validateBaseUrlResolved (DNS-aware base URL validation)', () => {
     });
   });
 
-  it('rejects the literal-IP cases the sync check already catches', async () => {
+  it('refuses the bogons the sync check catches and passes RFC1918 / ULA through', async () => {
     for (const baseUrl of [
-      'http://10.0.0.5:11434/v1',
       'http://169.254.169.254/latest/meta-data',
-      'http://[fd00::1]:11434/v1',
       'http://[fe80::1]:11434/v1',
+      'http://[::]/v1',
+      'http://0.0.0.0:11434/v1',
+      'http://224.0.0.1:11434/v1',
     ]) {
       expect(await validateBaseUrlResolved(baseUrl, lookupReturning([]))).toMatchObject({
         error: 'Internal IPs blocked',
         forbidden: true,
       });
+    }
+    // LAN / CGNAT / ULA pass on the user-config path (local-first).
+    for (const baseUrl of [
+      'http://10.0.0.5:11434/v1',
+      'http://192.168.1.5:11434/v1',
+      'http://100.64.0.1:11434/v1',
+      'http://[fd00::1]:11434/v1',
+      'http://[::ffff:192.168.1.5]:11434/v1',
+    ]) {
+      expect(
+        await validateBaseUrlResolved(baseUrl, lookupReturning([])),
+        `expected ${baseUrl} to be accepted`,
+      ).toMatchObject({});
     }
   });
 
@@ -4913,53 +4912,75 @@ describe('validateBaseUrlResolved (DNS-aware base URL validation)', () => {
     expect(lookup).not.toHaveBeenCalled();
   });
 
-  it('rejects public hostnames that resolve to private IPv4 ranges', async () => {
+  it('passes public hostnames that resolve into RFC1918 / CGNAT through (local-first)', async () => {
+    // Local-First: a hostname that DNS-resolves into private space is
+    // accepted on the user-config path. The asset-URL guard still pins a
+    // private range when the URL came from an upstream response.
     const cases: Array<{ resolved: string; family: number }> = [
       { resolved: '10.0.0.5', family: 4 },
       { resolved: '172.16.0.5', family: 4 },
       { resolved: '192.168.1.5', family: 4 },
       { resolved: '100.64.0.1', family: 4 },
-      { resolved: '169.254.169.254', family: 4 },
-      { resolved: '0.0.0.0', family: 4 },
-      { resolved: '224.0.0.1', family: 4 },
     ];
     for (const { resolved, family } of cases) {
       const result = await validateBaseUrlResolved(
-        'https://internal.example.com/v1',
+        'https://lan-gateway.home.lab/v1',
         lookupReturning([{ address: resolved, family }]),
       );
-      expect(result).toMatchObject({
-        error: 'Internal IPs blocked',
-        forbidden: true,
-      });
+      expect(
+        result.error,
+        `expected ${resolved} to be accepted`,
+      ).toBeUndefined();
     }
   });
 
-  it('rejects public hostnames that resolve to private IPv6 ranges', async () => {
-    for (const resolved of ['fd00::1', 'fe80::1', '::']) {
+  it('still refuses hostnames that resolve into the bogon set', async () => {
+    // 169.254/16, fe80::/10, ::, 0.0.0.0/8, >=224 — universally
+    // misconfigurations, not local-model hosts. Both halves stay refused.
+    for (const resolved of [
+      '169.254.169.254',
+      '0.0.0.0',
+      '224.0.0.1',
+      'fe80::1',
+      '::',
+    ]) {
       const result = await validateBaseUrlResolved(
-        'https://internal.example.com/v1',
-        lookupReturning([{ address: resolved, family: 6 }]),
+        'https://bogon.example.com/v1',
+        lookupReturning([{ address: resolved, family: resolved.includes(':') ? 6 : 4 }]),
       );
-      expect(result).toMatchObject({
+      expect(result, resolved).toMatchObject({
         error: 'Internal IPs blocked',
         forbidden: true,
       });
     }
   });
 
-  it('rejects when ANY resolved record (round-robin / dual-stack) is internal', async () => {
+  it('refuses when ANY resolved record is a bogon (round-robin / dual-stack)', async () => {
     const result = await validateBaseUrlResolved(
-      'https://mixed.example.com/v1',
+      'https://mixed-bogon.example.com/v1',
       lookupReturning([
         { address: '52.84.10.1', family: 4 },
-        { address: '10.0.0.5', family: 4 },
+        { address: '169.254.169.254', family: 4 },
       ]),
     );
     expect(result).toMatchObject({
       error: 'Internal IPs blocked',
       forbidden: true,
     });
+  });
+
+  it('passes round-robin results where one record is RFC1918 (local-first)', async () => {
+    // Mirrors the bogon case but with a LAN address instead: the LAN half
+    // of the contract means mixed public/private answers still resolve to
+    // a connectable address (the public one), so no error is returned.
+    const result = await validateBaseUrlResolved(
+      'https://mixed-lan.example.com/v1',
+      lookupReturning([
+        { address: '52.84.10.1', family: 4 },
+        { address: '10.0.0.5', family: 4 },
+      ]),
+    );
+    expect(result.error).toBeUndefined();
   });
 
   it('allows public hostnames that resolve to public addresses (the api.openai.com case)', async () => {
@@ -4989,72 +5010,5 @@ describe('validateBaseUrlResolved (DNS-aware base URL validation)', () => {
     const result = await validateBaseUrlResolved('https://offline.example.com/v1', failingLookup);
     expect(result.error).toBeUndefined();
     expect(failingLookup).toHaveBeenCalledOnce();
-  });
-
-  it('exempts a literal internal IP passed via allowedInternalHosts without resolving DNS (#3225)', async () => {
-    const lookup = lookupReturning([]);
-    const result = await validateBaseUrlResolved('http://10.0.0.5:4000/v1', lookup, {
-      allowedInternalHosts: ['10.0.0.5'],
-    });
-    expect(result.error).toBeUndefined();
-    expect(lookup).not.toHaveBeenCalled();
-  });
-
-  it('exempts an allowlisted hostname even though it resolves into private space (#3225)', async () => {
-    const result = await validateBaseUrlResolved(
-      'https://litellm.internal:4000/v1',
-      lookupReturning([{ address: '10.0.0.5', family: 4 }]),
-      { allowedInternalHosts: ['litellm.internal'] },
-    );
-    expect(result.error).toBeUndefined();
-  });
-
-  it('exempts a non-allowlisted hostname whose resolved address is itself allowlisted (#3225)', async () => {
-    const result = await validateBaseUrlResolved(
-      'https://gateway.example.com/v1',
-      lookupReturning([{ address: '10.0.0.5', family: 4 }]),
-      { allowedInternalHosts: ['10.0.0.5'] },
-    );
-    expect(result.error).toBeUndefined();
-  });
-
-  it('still blocks a resolved private address that is NOT on the allowlist (#3225)', async () => {
-    const result = await validateBaseUrlResolved(
-      'https://other.example.com/v1',
-      lookupReturning([{ address: '192.168.1.5', family: 4 }]),
-      { allowedInternalHosts: ['10.0.0.5'] },
-    );
-    expect(result).toMatchObject({ error: 'Internal IPs blocked', forbidden: true });
-  });
-});
-
-describe('validateUserProviderBaseUrl: OD_ALLOWED_INTERNAL_HOSTS opt-in (issue #3225)', () => {
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
-
-  it('exempts an operator-allowlisted literal internal IP for user-configured endpoints', async () => {
-    vi.stubEnv('OD_ALLOWED_INTERNAL_HOSTS', '10.0.0.5');
-    const result = await validateUserProviderBaseUrl('http://10.0.0.5:4000/v1');
-    expect(result.error).toBeUndefined();
-  });
-
-  it('exempts a hostname that resolves into private space when that hostname is allowlisted', async () => {
-    vi.stubEnv('OD_ALLOWED_INTERNAL_HOSTS', 'litellm.internal');
-    const lookup = vi.fn(async () => [{ address: '10.0.0.5', family: 4 }]);
-    const result = await validateUserProviderBaseUrl('http://litellm.internal:4000/v1', lookup);
-    expect(result.error).toBeUndefined();
-  });
-
-  it('still blocks a private endpoint that is not on the allowlist', async () => {
-    vi.stubEnv('OD_ALLOWED_INTERNAL_HOSTS', '10.0.0.5');
-    const result = await validateUserProviderBaseUrl('http://192.168.1.5:4000/v1');
-    expect(result).toMatchObject({ error: 'Internal IPs blocked', forbidden: true });
-  });
-
-  it('keeps the attacker-controllable asset guard strict — the plain resolver never consults the allowlist', async () => {
-    vi.stubEnv('OD_ALLOWED_INTERNAL_HOSTS', '10.0.0.5');
-    const result = await validateBaseUrlResolved('http://10.0.0.5:4000/v1');
-    expect(result).toMatchObject({ error: 'Internal IPs blocked', forbidden: true });
   });
 });

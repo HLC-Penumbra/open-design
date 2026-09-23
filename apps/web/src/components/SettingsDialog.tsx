@@ -1183,13 +1183,13 @@ export function isValidApiBaseUrl(value: string): boolean {
   if (!/^https?:\/\//i.test(trimmed)) return false;
   const result = validateBaseUrl(trimmed);
   // The internal-IP / SSRF decision belongs to the daemon, which is the single
-  // source of truth and honors the operator's OD_ALLOWED_INTERNAL_HOSTS
-  // allowlist — a value the browser cannot see (#3225). A `forbidden` result
-  // here is a syntactically-valid URL that points at an internal address; keep
-  // it UI-valid so the operator can run the connection test / model fetch and
-  // get the daemon's authoritative answer (allowed when listed, a clear
-  // "Internal IPs blocked" otherwise). Only genuinely malformed URLs stay
-  // invalid client-side.
+  // source of truth. Local-First: LAN / CGNAT / ULA base URLs are accepted
+  // out of the box; only `169.254/16`, `fe80::/10`, `0.0.0.0`, and `::`
+  // remain refused on the user-config path. A `forbidden` result here is a
+  // syntactically-valid URL that points at one of those bogons; keep it
+  // UI-valid so the user can run the connection test / model fetch and see
+  // the daemon's reason. The asset-download URL guard remains strict
+  // regardless.
   if (result.forbidden) return true;
   return Boolean(result.parsed && !result.error);
 }

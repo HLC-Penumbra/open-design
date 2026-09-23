@@ -557,9 +557,9 @@ describe('SettingsDialog provider model fetch helpers', () => {
         'openai',
       ),
     ).toBe(false);
-    // #3225 — an internal-IP endpoint is now fetchable from the UI's
-    // perspective; the daemon enforces the OD_ALLOWED_INTERNAL_HOSTS allowlist
-    // and returns the authoritative allow/block decision.
+    // Local-First — an internal-IP endpoint is now fetchable from the UI's
+    // perspective; the daemon returns the authoritative allow/block decision
+    // for the bogon set it still refuses (`169.254/16`, `fe80::/10`, etc.).
     expect(
       canFetchProviderModels(
         { apiKey: 'sk-openai', baseUrl: 'http://10.0.0.5:11434/v1' },
@@ -761,13 +761,11 @@ describe('SettingsDialog API Base URL validation', () => {
     expect(isValidApiBaseUrl('https://')).toBe(false);
   });
 
-  it('keeps syntactically-valid internal-IP base URLs UI-valid so the daemon allowlist can decide (#3225)', () => {
-    // The internal-IP / SSRF decision belongs to the daemon, which honors the
-    // operator's OD_ALLOWED_INTERNAL_HOSTS allowlist — a value the browser
-    // cannot see. These are well-formed URLs that merely point at internal
-    // addresses, so the client must not block them: the operator needs to run
-    // the connection test / model fetch and get the daemon's authoritative
-    // answer (allowed when listed, "Internal IPs blocked" otherwise).
+  it('keeps syntactically-valid internal-IP base URLs UI-valid so the daemon can decide', () => {
+    // The internal-IP / SSRF decision belongs to the daemon. These are
+    // well-formed URLs that merely point at internal addresses, so the
+    // client must not block them: the user needs to run the connection test
+    // / model fetch and get the daemon's authoritative answer.
     for (const internal of [
       'http://0.0.0.0:11434/v1',
       'http://10.0.0.5:11434/v1',

@@ -480,8 +480,9 @@ test('[P0] BYOK autosave waits until required fields are valid', async ({ page }
 
   const baseUrlInput = dialog.getByLabel('Base URL');
   // A non-http scheme is still rejected client-side. (An internal-IP URL is no
-  // longer rejected here — it is syntactically valid and the daemon owns the
-  // OD_ALLOWED_INTERNAL_HOSTS decision; see #3225.)
+  // longer rejected here — it is syntactically valid and the daemon now
+  // permits RFC1918 / CGNAT / ULA on the user-config path; only the bogons
+  // it still refuses are reported as `forbidden`.)
   await baseUrlInput.fill('ftp://api.example.com');
   await expect(dialog.locator('#settings-base-url-error')).toContainText(/public http:\/\/ or https:\/\//i);
 
@@ -489,6 +490,13 @@ test('[P0] BYOK autosave waits until required fields are valid', async ({ page }
   await expect.poll(async () => readSavedConfig(page)).toMatchObject({
     apiKey: 'sk-openai-test',
     baseUrl: 'http://localhost:11434/v1',
+  });
+
+  // Local-First: a LAN Ollama URL is accepted the same way as loopback.
+  await baseUrlInput.fill('http://192.168.1.10:11434/v1');
+  await expect.poll(async () => readSavedConfig(page)).toMatchObject({
+    apiKey: 'sk-openai-test',
+    baseUrl: 'http://192.168.1.10:11434/v1',
   });
 });
 

@@ -167,10 +167,11 @@ export function validateByokDraft(
       action: 'focus_base_url',
     });
   } else {
-    // #3225 — a `forbidden` result is a syntactically-valid URL that points at
-    // an internal address. Don't block it here: the Test / model-fetch actions
-    // gate on these issues, and the daemon owns the OD_ALLOWED_INTERNAL_HOSTS
-    // decision. Only genuinely malformed / non-http URLs are a client blocker.
+    // Local-First: a `forbidden` result is a syntactically-valid URL that
+    // points at a bogon the daemon still refuses (`169.254/16`, `fe80::/10`,
+    // `0.0.0.0`, `::`). Don't block it here: the Test / model-fetch actions
+    // gate on these issues and surface the daemon's reason. Only genuinely
+    // malformed / non-http URLs are a client blocker.
     const baseUrlCheck = validateBaseUrl(baseUrl);
     if (baseUrlCheck.error && !baseUrlCheck.forbidden) {
       issues.push({

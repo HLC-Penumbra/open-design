@@ -9,7 +9,7 @@ import type {
 } from '@open-design/contracts/api/providerModels';
 import type { ModelCapability, ModelCost, ModelMetadata } from '@open-design/contracts';
 import { isLoopbackApiHost } from '@open-design/contracts/api/connectionTest';
-import { redactSecrets, validateUserProviderBaseUrl } from '../connectionTest.js';
+import { redactSecrets, validateBaseUrlResolved } from '../connectionTest.js';
 import { googleProviderModelsUrl, normalizeGoogleModelId } from './google-models.js';
 import { aihubmixHeaders, aihubmixCatalogUrl, parseAIHubMixCatalog } from './aihubmix.js';
 
@@ -304,7 +304,7 @@ export async function listProviderModels(
     };
   }
 
-  const validated = await validateUserProviderBaseUrl(input.baseUrl);
+  const validated = await validateBaseUrlResolved(input.baseUrl);
   if (validated.error || !validated.parsed) {
     return {
       ok: false,

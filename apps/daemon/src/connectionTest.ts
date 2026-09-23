@@ -63,11 +63,10 @@ import { aihubmixHeaders } from './integrations/aihubmix.js';
 import type { AgentCliEnvPrefs } from './app-config.js';
 import type { RuntimeAgentDef } from './runtimes/types.js';
 import { preparePromptFileForAgent, type PreparedPromptFile } from './runtimes/prompt-file.js';
-import { configuredAllowedInternalHosts } from './origin-validation.js';
 import {
-  isAllowlistedInternalHost,
   isBlockedExternalApiHostname,
   isLoopbackApiHost,
+  isUserErrorBogonApiHostname,
   validateBaseUrl,
   type AgentTestRequest,
   type BaseUrlValidationResult,
@@ -146,11 +145,6 @@ export async function validateBaseUrlResolved(
   // When forbidLoopback is set, do NOT short-circuit on loopback — let it
   // fall through to the block check (issue #5478).
   if (!options.forbidLoopback && isLoopbackApiHost(hostname)) return sync;
-  // Issue #3225 — an operator who trusts this hostname has opted it out of the
-  // guard entirely, so skip the resolved-IP block even though it points into
-  // private space. The sync check above already honored a literal-IP allowlist
-  // entry; this covers the hostname-that-resolves-private case.
-  if (isAllowlistedInternalHost(hostname, options.allowedInternalHosts)) return sync;
   if (looksLikeIpLiteral(hostname)) return sync;
 
   let addresses: DnsLookupAddress[];
@@ -182,11 +176,14 @@ export async function validateBaseUrlResolved(
       }
       continue;
     }
-    // A resolved address the operator explicitly allowlisted (they listed the
-    // IP rather than the hostname) is permitted; everything else in private
-    // space is still blocked.
-    if (isAllowlistedInternalHost(ip, options.allowedInternalHosts)) continue;
-    if (isBlockedExternalApiHostname(ip)) {
+    // Asset path: refuse every non-public resolved address.
+    if (options.forbidLoopback && isBlockedExternalApiHostname(ip)) {
+      return { error: 'Internal IPs blocked', forbidden: true };
+    }
+    // User-config path: refuse only the bogons that are universally
+    // misconfigurations. RFC1918 / CGNAT / IPv6 ULA resolved addresses are
+    // accepted — that is the local-first contract.
+    if (!options.forbidLoopback && isUserErrorBogonApiHostname(ip)) {
       return { error: 'Internal IPs blocked', forbidden: true };
     }
   }
@@ -196,28 +193,6 @@ export async function validateBaseUrlResolved(
   // a public IP here and then 127.0.0.1 at fetch time, so the daemon connects
   // to loopback despite the validation having passed (issue #5478).
   return { ...sync, resolvedAddresses: addresses };
-}
-
-/**
- * Validate a base URL that the USER deliberately configured as a provider
- * endpoint (connection test, model discovery, BYOK chat dispatch). Identical
- * to {@link validateBaseUrlResolved} except it honors the operator's
- * `OD_ALLOWED_INTERNAL_HOSTS` allowlist (issue #3225), so an internally hosted
- * gateway on an RFC1918 address can be reached when — and only when — the
- * operator opted in.
- *
- * INVARIANT: use this ONLY for user-configured endpoints. URLs that arrive
- * inside an upstream response (image/video download links) are
- * attacker-controllable and MUST stay on the strict {@link assertExternalAssetUrl}
- * / {@link validateBaseUrlResolved} path, which never consults the allowlist.
- */
-export function validateUserProviderBaseUrl(
-  baseUrl: string,
-  lookup: DnsLookupFn = defaultDnsLookup,
-): Promise<BaseUrlValidationResult> {
-  return validateBaseUrlResolved(baseUrl, lookup, {
-    allowedInternalHosts: configuredAllowedInternalHosts(),
-  });
 }
 
 /**
@@ -1598,7 +1573,7 @@ export async function testProviderConnection(
   const start = Date.now();
   const model = String(input.model ?? '');
   const normalizedInput = normalizeProviderTestInput(input);
-  const validated = await validateUserProviderBaseUrl(normalizedInput.baseUrl);
+  const validated = await validateBaseUrlResolved(normalizedInput.baseUrl);
   if (validated.error || !validated.parsed) {
     const kind: ConnectionTestKind = validated.forbidden ? 'forbidden' : 'invalid_base_url';
     return {
