@@ -1,24 +1,31 @@
 # Woodpecker CI for the local-first fork.
 #
-# Two layers, both small on purpose:
+# Three layers, all blocking by default on `main`:
 #
 #   Tier 1 (always-on, ~3-5 min, blocks merge)
 #     pnpm guard                       — static checks, layout guards, package boundary checks
 #     pnpm typecheck                   — typescript correctness across all packages
 #     contracts tests                  — shared contracts/DTOs are the lingua franca
 #     daemon BYOK + SSRF slice         — local-first-ssrf, origin-validation, asset URL guards
+#     desktop build                    — Electron renderer / main / preload compile
 #     packaged tests                   — env allowlist and packaged sidecars
 #
-#   Tier 2 (always-on, ~15-25 min, blocks merge)
+#   Tier 2 (always-on, ~25-40 min, blocks merge)
 #     daemon full Vitest               — broad regression net for "I've been editing many things"
 #     web tests                        — i18n / components
 #     packages tests                   — sidecar, sidecar-proto, platform, standalone, contracts
 #     tools tests                      — tools-dev, tools-pack, tools-serve, tools-release
-#
-#   Tier 3 (manual trigger only, ~60+ min)
 #     e2e Vitest                       — cross-app / cross-runtime tests
+#     playwright critical              — high-value Playwright lanes that run on every PR
+#     ui-p0                            — P0-tagged UI scenarios (the P0 release gate)
 #
-# Why this is NOT a copy of the upstream `.github/workflows/ci.yml`:
+# Why this is the only merge gate:
+#   - Upstream `.github/workflows/ci.yml` ran ~12 required checks per PR via a
+#     shared `pull_request` + `merge_group` workflow that gated on a custom
+#     runner pool (`nexu-runners-small`). The fork does not have that pool, so
+#     the work was duplicated under Woodpecker instead. The Playwright lanes
+#     previously lived in `ci.yml` are folded into Tier 2 here so PR coverage
+#     does not regress.
 #   - No `convergence.atom.yml` / `comment.atom.yml` / `report.atom.yml` /
 #     `autofix.atom.yml`. Those are GitHub-Actions-specific atomic capabilities
 #     (see `.github/AGENTS.md`). Woodpecker just runs tests and reports status.
@@ -26,21 +33,24 @@
 #     an R2 bucket we don't have on a personal fork. The convergence cache is
 #     a 1-to-1 mapping of declared workloads to validated past runs, with
 #     public read access; on a fork we just re-run.
-#   - No custom runner pool (`nexu-runners-small` is the upstream ARC fleet);
-#     we run on the Woodpecker agent's image.
-#   - Tier 3 is `when.event: manual` because it needs the full tools-dev
-#     harness + a packaged build, and doesn't gate a feature PR's correctness.
+#   - No custom runner pool; we run on the Woodpecker agent's image.
 #
 # Required secrets on the Woodpecker agent (not on the fork):
 #   - WOODPECKER_GITHUB_HOOK_SECRET — matches the webhook's "Secret" header
 #   - A PAT with `repo` scope (gives `repo:status`) for status reporting
 #
-# Branch protection on `main` requires the Tier 1 checks to pass before merge.
-# Tier 2 is reported but not blocking by default.
+# Branch protection on `main` requires every Tier 1 + Tier 2 check to pass
+# before merge. The release-channel workflows that remain under
+# `.github/workflows/` (`release-*.yml`, `finalize-release.yml`,
+# `main-prerelease-win-smoke.yml`) are dormant on the fork: they hard-gate to
+# `nexu-io/open-design` and expect the upstream runner fleet, so they neither
+# fire nor add required checks.
 #
 # Step isolation: each Woodpecker step is a fresh container with no shared
 # corepack state. Every step sources `.woodpecker/pnpm-setup.sh` before any
-# `pnpm …` invocation.
+# `pnpm …` invocation. The three Playwright steps additionally need
+# `pnpm install --frozen-lockfile` because each step's container is fresh and
+# does not share `node_modules` with the `install` step.
 
 when:
   event: [push, pull_request, manual]
@@ -107,12 +117,10 @@ steps:
       - pnpm --filter @open-design/packaged test
     depends_on: [install, desktop-build]
 
-  # --- Tier 2: broader regression (~15-25 min) ---
+  # --- Tier 2: broader regression (~25-40 min) ---
 
   daemon-full-tests:
     image: node:24
-    when:
-      event: [manual]
     commands:
       - . .woodpecker/pnpm-setup.sh
       - pnpm --filter @open-design/daemon test
@@ -120,8 +128,6 @@ steps:
 
   web-tests:
     image: node:24
-    when:
-      event: [manual]
     commands:
       - . .woodpecker/pnpm-setup.sh
       # Pre-existing CI-vs-local flakiness on jsdom timing surfaces a new flaky
@@ -172,13 +178,52 @@ steps:
       - pnpm --filter @open-design/tools-release test
     depends_on: [install]
 
-  # --- Tier 3: heavy lane (manual trigger only) ---
+  # --- Tier 2 continued: e2e + Playwright (was upstream ci.yml) ---
 
-  e2e-heavy:
+  e2e-vitest:
     image: node:24
-    when:
-      event: [manual]
     commands:
       - . .woodpecker/pnpm-setup.sh
       - pnpm --filter @open-design/e2e test
+    depends_on: [install]
+
+  playwright-critical:
+    # mcr.microsoft.com/playwright ships Chromium + Firefox + WebKit and the
+    # OS deps they need, so we skip `playwright install --with-deps` (which
+    # hangs until the job timeout on a vanilla node:24 image).
+    image: mcr.microsoft.com/playwright:v1.60.0-jammy
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm install --frozen-lockfile
+      - pnpm --filter @open-design/daemon build
+      - pnpm --filter @open-design/desktop build
+      - pnpm --filter @open-design/web build:sidecar
+      - pnpm -C e2e exec tsx scripts/playwright.ts clean
+      - pnpm -C e2e exec playwright test -c playwright.config.ts
+          ui/critical-smoke.test.ts
+          ui/entry-chrome-flows.test.ts
+          ui/app.test.ts
+          ui/app-design-files.test.ts
+          ui/app-manual-edit.test.ts
+          ui/app-restoration.test.ts
+          ui/api-empty-response.test.ts
+          ui/amr-onboarding.test.ts
+          ui/project-management-flows.test.ts
+          ui/settings-api-protocol.test.ts
+          ui/settings-local-cli-codex-fallback.test.ts
+          ui/workspace-keyboard-flows.test.ts
+          --grep '@critical'
+    depends_on: [install]
+
+  ui-p0:
+    image: mcr.microsoft.com/playwright:v1.60.0-jammy
+    commands:
+      - . .woodpecker/pnpm-setup.sh
+      - pnpm install --frozen-lockfile
+      - pnpm --filter @open-design/daemon build
+      - pnpm --filter @open-design/desktop build
+      - pnpm --filter @open-design/web build:sidecar
+      - pnpm -C e2e exec tsx scripts/playwright.ts clean
+      - pnpm -C e2e exec playwright test -c playwright.config.ts
+          ui --grep '\[P0\]'
     depends_on: [install]
